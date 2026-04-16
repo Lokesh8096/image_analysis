@@ -7,6 +7,7 @@ import OpenAI, {
   toFile,
 } from "openai";
 import { NextResponse } from "next/server";
+import { resolveRoleProfile } from "../../lib/roleProfiles";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -52,6 +53,7 @@ const MAX_OPENAI_RETRIES = Math.max(
 );
 const NO_ACCESS_RESULT = "NO_ACCESS";
 const TRUE_VALUES = new Set(["1", "true", "yes", "y", "on"]);
+const FALSE_VALUES = new Set(["0", "false", "no", "n", "off"]);
 const OPENAI_TIMEOUT_SECONDS = Math.max(
   1,
   Number.parseFloat(process.env.OPENAI_TIMEOUT_SECONDS || "120") || 120
@@ -73,15 +75,23 @@ const IDENTITY_ANALYSIS_ENABLED = TRUE_VALUES.has(
     .trim()
     .toLowerCase()
 );
-const DEFAULT_ANALYSIS = {
-  image_purpose: "Professional candidate photo",
-  purpose_description:
-    "The image appears to be intended for a professional profile or career-oriented use.",
-  strengths: ["The image was successfully analyzed."],
-  weaknesses: ["The analysis model did not return full structured feedback."],
-  improvements: [
-    "Retry the request to get more specific role-based improvement suggestions.",
-  ],
+const CATEGORY_KEYS = [
+  "appearance",
+  "grooming",
+  "dress_code",
+  "professionalism",
+];
+const VALID_SUITABILITY_STATUSES = new Set([
+  "unsuitable",
+  "improvable",
+  "suitable",
+]);
+const VALID_CATEGORY_RATINGS = new Set(["poor", "fair", "good", "excellent"]);
+const CATEGORY_LABELS = {
+  appearance: "Appearance",
+  grooming: "Grooming",
+  dress_code: "Dress code",
+  professionalism: "Professionalism",
 };
 
 function createErrorResponse(message, status = 400) {
@@ -585,9 +595,118 @@ function normalizeList(value) {
   return [];
 }
 
-function parseAnalysisOutput(rawOutput) {
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalizedValue = value.trim().toLowerCase();
+
+    if (TRUE_VALUES.has(normalizedValue)) {
+      return true;
+    }
+
+    if (FALSE_VALUES.has(normalizedValue)) {
+      return false;
+    }
+  }
+
+  return fallback;
+}
+
+function createDefaultCategoryFeedback(roleProfile) {
+  return {
+    appearance: {
+      rating: "fair",
+      remark:
+        "Appearance is workable for a professional portrait, but it needs a cleaner and more role-aligned presentation.",
+    },
+    grooming: {
+      rating: "fair",
+      remark:
+        "Grooming looks usable, though sharper polish would strengthen the overall professional impression.",
+    },
+    dress_code: {
+      rating: "fair",
+      remark: `Clothing is serviceable, but it could be aligned more clearly with ${roleProfile.label} expectations.`,
+    },
+    professionalism: {
+      rating: "fair",
+      remark:
+        "The image has professional potential, but it would benefit from more intentional framing, posture, or context.",
+    },
+  };
+}
+
+function getDefaultSuitabilitySummary(status, roleProfile) {
+  switch (status) {
+    case "unsuitable":
+      return `This upload is not strong enough for a ${roleProfile.label} portrait and should be replaced with a more role-appropriate image.`;
+    case "suitable":
+      return `This upload already fits a ${roleProfile.label} portrait and mainly needs polish rather than major correction.`;
+    case "improvable":
+    default:
+      return `This upload is usable for a ${roleProfile.label} portrait, but it needs targeted improvements to feel fully role-ready.`;
+  }
+}
+
+function createDefaultAnalysis(roleProfile) {
+  return {
+    image_purpose: "Professional profile photo",
+    purpose_description:
+      "The image appears intended for a professional or career-oriented profile, but the structured analysis fallback was used.",
+    suitability_status: "improvable",
+    suitability_summary: getDefaultSuitabilitySummary("improvable", roleProfile),
+    requires_reupload: false,
+    category_feedback: createDefaultCategoryFeedback(roleProfile),
+    strengths: [
+      "The upload appears usable as a starting point for a professional portrait edit.",
+    ],
+    weaknesses: [
+      "The analysis model did not return full structured suitability feedback.",
+    ],
+    improvements: [
+      `Align the image more clearly with ${roleProfile.label} expectations for dress, presence, and setting.`,
+      "Refine grooming, framing, and background professionalism where needed.",
+    ],
+  };
+}
+
+function normalizeCategoryFeedback(categoryKey, categoryFeedback, fallbackFeedback) {
+  const normalizedRating = normalizeText(categoryFeedback?.rating).toLowerCase();
+  const rating = VALID_CATEGORY_RATINGS.has(normalizedRating)
+    ? normalizedRating
+    : fallbackFeedback.rating;
+  const remark = normalizeText(categoryFeedback?.remark) || fallbackFeedback.remark;
+
+  return {
+    rating,
+    remark,
+  };
+}
+
+function normalizeCategoryFeedbackMap(parsedFeedback, fallbackFeedback) {
+  return CATEGORY_KEYS.reduce((result, categoryKey) => {
+    result[categoryKey] = normalizeCategoryFeedback(
+      categoryKey,
+      parsedFeedback?.[categoryKey],
+      fallbackFeedback[categoryKey]
+    );
+
+    return result;
+  }, {});
+}
+
+function parseAnalysisOutput(rawOutput, roleProfile) {
+  const fallbackAnalysis = createDefaultAnalysis(roleProfile);
+
   if (!rawOutput?.trim()) {
-    return DEFAULT_ANALYSIS;
+    return fallbackAnalysis;
   }
 
   try {
@@ -595,31 +714,134 @@ function parseAnalysisOutput(rawOutput) {
     const strengths = normalizeList(parsed.strengths);
     const weaknesses = normalizeList(parsed.weaknesses);
     const improvements = normalizeList(parsed.improvements);
+    let suitabilityStatus = normalizeText(parsed.suitability_status).toLowerCase();
+
+    if (!VALID_SUITABILITY_STATUSES.has(suitabilityStatus)) {
+      suitabilityStatus = fallbackAnalysis.suitability_status;
+    }
+
+    let requiresReupload = normalizeBoolean(
+      parsed.requires_reupload,
+      suitabilityStatus === "unsuitable"
+    );
+
+    if (suitabilityStatus === "unsuitable" || requiresReupload) {
+      suitabilityStatus = "unsuitable";
+      requiresReupload = true;
+    }
 
     return {
       image_purpose:
-        String(parsed.image_purpose || "").trim() ||
-        DEFAULT_ANALYSIS.image_purpose,
+        normalizeText(parsed.image_purpose) || fallbackAnalysis.image_purpose,
       purpose_description:
-        String(parsed.purpose_description || "").trim() ||
-        DEFAULT_ANALYSIS.purpose_description,
-      strengths: strengths.length ? strengths : DEFAULT_ANALYSIS.strengths,
-      weaknesses: weaknesses.length ? weaknesses : DEFAULT_ANALYSIS.weaknesses,
+        normalizeText(parsed.purpose_description) ||
+        fallbackAnalysis.purpose_description,
+      suitability_status: suitabilityStatus,
+      suitability_summary:
+        normalizeText(parsed.suitability_summary) ||
+        getDefaultSuitabilitySummary(suitabilityStatus, roleProfile),
+      requires_reupload: requiresReupload,
+      category_feedback: normalizeCategoryFeedbackMap(
+        parsed.category_feedback,
+        fallbackAnalysis.category_feedback
+      ),
+      strengths: strengths.length ? strengths : fallbackAnalysis.strengths,
+      weaknesses: weaknesses.length ? weaknesses : fallbackAnalysis.weaknesses,
       improvements: improvements.length
         ? improvements
-        : DEFAULT_ANALYSIS.improvements,
+        : fallbackAnalysis.improvements,
     };
   } catch (error) {
     console.warn("Unable to parse structured analysis output:", error);
-    return DEFAULT_ANALYSIS;
+    return fallbackAnalysis;
   }
 }
 
-function formatRemarks(analysis) {
+function formatRoleProfileForPrompt(roleProfile) {
   return [
-    `Image Purpose: ${analysis.image_purpose}`,
+    `Role: ${roleProfile.label}`,
+    `Expected dress tone: ${roleProfile.dressTone}`,
+    `Expected demeanor or presence: ${roleProfile.demeanor}`,
+    `Expected background or professional context: ${roleProfile.backgroundContext}`,
+  ].join("\n");
+}
+
+function formatCategoryFeedbackForPrompt(categoryFeedback) {
+  return CATEGORY_KEYS.map((categoryKey) => {
+    const category = categoryFeedback[categoryKey];
+    return `- ${CATEGORY_LABELS[categoryKey]} (${category.rating}): ${category.remark}`;
+  }).join("\n");
+}
+
+function getSuitabilityDirective(analysis) {
+  switch (analysis.suitability_status) {
+    case "suitable":
+      return "Apply light, polished improvements only. Keep the result close to the original while refining professionalism.";
+    case "improvable":
+      return "Apply targeted, role-specific improvements that strengthen the image without changing the person's identity.";
+    case "unsuitable":
+    default:
+      return "Do not attempt to salvage an image that is fundamentally mismatched for the role.";
+  }
+}
+
+function buildAnalysisPrompt(roleProfile) {
+  return `You are reviewing an uploaded portrait for someone targeting the role below.
+
+${formatRoleProfileForPrompt(roleProfile)}
+
+First determine what the image currently represents or is likely being used for.
+Then judge how suitable it is for this role profile.
+
+Suitability rules:
+- "unsuitable": the image is not recoverable for the role by editing alone. Examples include the wrong context, non-professional framing, poor face visibility, multiple people, irrelevant pose or background, or clearly mismatched clothing/context.
+- "improvable": the image is relevant enough to keep, but it needs targeted fixes to presentation, professionalism, grooming, clothing, or setting.
+- "suitable": the image already fits the role well and only needs polish.
+
+Return ONLY valid JSON with this exact shape:
+{
+  "image_purpose": "string",
+  "purpose_description": "string",
+  "suitability_status": "improvable",
+  "suitability_summary": "string",
+  "requires_reupload": false,
+  "category_feedback": {
+    "appearance": { "rating": "fair", "remark": "string" },
+    "grooming": { "rating": "fair", "remark": "string" },
+    "dress_code": { "rating": "fair", "remark": "string" },
+    "professionalism": { "rating": "fair", "remark": "string" }
+  },
+  "strengths": ["string"],
+  "weaknesses": ["string"],
+  "improvements": ["string"]
+}
+
+Rules for the JSON:
+- "suitability_status" must be one of: "unsuitable", "improvable", or "suitable".
+- Set "requires_reupload" to true only when the image is unsuitable and should be replaced instead of edited.
+- Each category "rating" must be one of: "poor", "fair", "good", or "excellent".
+- Keep remarks concise, respectful, practical, and specific to the role expectations above.
+- If the image is unsuitable, make the weaknesses and improvements explain what should be corrected in the next upload.
+- Use 1-3 short bullets in strengths, weaknesses, and improvements.
+- Do not wrap the JSON in markdown fences.`;
+}
+
+function formatRemarks(analysis, roleProfile) {
+  return [
+    `Target Role: ${roleProfile.label}`,
     "",
+    `Suitability: ${analysis.suitability_status}`,
+    `Summary: ${analysis.suitability_summary}`,
+    `Reupload Required: ${analysis.requires_reupload ? "Yes" : "No"}`,
+    "",
+    `Image Purpose: ${analysis.image_purpose}`,
     `Purpose Description: ${analysis.purpose_description}`,
+    "",
+    "Category Feedback:",
+    ...CATEGORY_KEYS.map((categoryKey) => {
+      const category = analysis.category_feedback[categoryKey];
+      return `- ${CATEGORY_LABELS[categoryKey]} (${category.rating}): ${category.remark}`;
+    }),
     "",
     "Strengths:",
     ...analysis.strengths.map((item) => `- ${item}`),
@@ -679,63 +901,71 @@ Return plain text only in one concise line.`,
   }
 }
 
-function buildEditPrompt({ role, analysis }) {
-  return `Improve this exact same person's image for a "${role}" role.
+function buildPromptContext({ roleProfile, analysis }) {
+  return `Role profile:
+${formatRoleProfileForPrompt(roleProfile)}
 
 Current image purpose:
-${analysis.image_purpose}
+- ${analysis.image_purpose}
+- ${analysis.purpose_description}
 
-How the image reads now:
-${analysis.purpose_description}
+Suitability verdict:
+- Status: ${analysis.suitability_status}
+- Summary: ${analysis.suitability_summary}
+- Guidance: ${getSuitabilityDirective(analysis)}
 
-Role-specific strengths to preserve:
+Per-category professional readiness feedback:
+${formatCategoryFeedbackForPrompt(analysis.category_feedback)}
+
+Strengths to preserve:
 ${analysis.strengths.map((item) => `- ${item}`).join("\n")}
 
 Weaknesses to correct:
 ${analysis.weaknesses.map((item) => `- ${item}`).join("\n")}
 
-Improvement priorities:
-${analysis.improvements.map((item) => `- ${item}`).join("\n")}
+Improvement directives:
+${analysis.improvements.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function buildEditPrompt({ roleProfile, analysis }) {
+  return `Improve this exact same person's image for the role profile below.
+
+${buildPromptContext({ roleProfile, analysis })}
+
+Keep clothing aligned with this dress expectation: ${roleProfile.dressTone}
+Keep the person's expression, posture, and presence aligned with this expectation: ${roleProfile.demeanor}
+Use or refine the setting so it matches this professional context: ${roleProfile.backgroundContext}
 
 Preserve the person's identity, facial structure, skin tone, hairstyle, and overall likeness.
-Enhance lighting, clean up the background, improve posture, and make the image look more polished and professional.
+Enhance lighting, posture, wardrobe polish, grooming, and background professionalism only as needed to satisfy the role expectations.
 Keep it realistic, high quality, and suitable for LinkedIn, resumes, or a career profile.
 Do not add other people, do not stylize it into illustration, and do not noticeably change who the person is.`;
 }
 
 function buildGenerateFromReferencePrompt({
-  role,
+  roleProfile,
   analysis,
   identityDescription,
 }) {
-  return `Create a new improved professional portrait for a "${role}" role based on the previously analyzed source photo.
+  return `Create a new improved professional portrait based on the previously analyzed source photo.
+
+${buildPromptContext({ roleProfile, analysis })}
 
 Reference identity details:
 ${identityDescription || "Use the uploaded source photo as the identity reference."}
 
-Current image purpose:
-${analysis.image_purpose}
-
-How the image reads now:
-${analysis.purpose_description}
-
-Role-specific strengths to preserve:
-${analysis.strengths.map((item) => `- ${item}`).join("\n")}
-
-Weaknesses to correct:
-${analysis.weaknesses.map((item) => `- ${item}`).join("\n")}
-
-Improvement priorities:
-${analysis.improvements.map((item) => `- ${item}`).join("\n")}
+Clothing should align with this dress expectation: ${roleProfile.dressTone}
+Expression, posture, and overall presence should align with this expectation: ${roleProfile.demeanor}
+The background and scene should align with this professional context: ${roleProfile.backgroundContext}
 
 The output must remain the same person with the same identity, facial geometry, hairstyle, skin tone, and overall likeness.
-Improve lighting, posture, professionalism, and background quality.
+Improve lighting, posture, professionalism, and background quality while following the role-specific guidance above.
 Keep the result realistic, polished, and suitable for LinkedIn, resumes, and career profiles.
 Do not add other people and do not noticeably change who the person is.`;
 }
 
-function createDownloadFilename(role) {
-  const safeRole = role.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+function createDownloadFilename(roleKey) {
+  const safeRole = roleKey.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   return `refined-${safeRole || "career-photo"}.png`;
 }
 
@@ -783,7 +1013,9 @@ export async function POST(request) {
       return createErrorResponse("Only JPG and PNG images are supported.");
     }
 
-    const role = roleValue.trim();
+    const roleInput = roleValue.trim();
+    const roleProfile = resolveRoleProfile(roleInput);
+
     const imageBuffer = Buffer.from(await imageValue.arrayBuffer());
 
     if (!imageBuffer.length) {
@@ -806,22 +1038,7 @@ export async function POST(request) {
           content: [
             {
               type: "input_text",
-              text: `You are reviewing an uploaded image for someone targeting a "${role}" role.
-
-Analyze both:
-1. What the image currently represents or is likely being used for.
-2. How well it supports the user's target role.
-
-Return ONLY valid JSON with this exact shape:
-{
-  "image_purpose": "short label describing the image's apparent role or purpose",
-  "purpose_description": "1-2 sentence explanation of what the image represents or how it reads right now",
-  "strengths": ["...", "..."],
-  "weaknesses": ["...", "..."],
-  "improvements": ["...", "..."]
-}
-
-Keep the feedback concise, practical, respectful, and specific to the target role. Do not wrap the JSON in markdown fences.`,
+              text: buildAnalysisPrompt(roleProfile),
             },
             {
               type: "input_image",
@@ -833,18 +1050,37 @@ Keep the feedback concise, practical, respectful, and specific to the target rol
       ],
     });
 
-    const analysis = parseAnalysisOutput(analysisResponse.output_text);
-    const remarks = formatRemarks(analysis);
-    const identityDescription = await describeReferenceIdentity({
-      openai,
-      imageDataUrl,
-    });
+    const analysis = parseAnalysisOutput(analysisResponse.output_text, roleProfile);
+    const remarks = formatRemarks(analysis, roleProfile);
+
+    if (analysis.requires_reupload) {
+      return NextResponse.json({
+        success: true,
+        remarks,
+        analysis,
+        improved_image: null,
+        download_filename: null,
+        image_strategy: null,
+        image_model_used: null,
+        transform_mode: IMAGE_TRANSFORM_MODE,
+      });
+    }
+
+    const needsReferenceIdentity =
+      IMAGE_TRANSFORM_MODE === "generate_from_reference" ||
+      (ALLOW_GENERATE_FALLBACK && Boolean(GENERATE_FALLBACK_MODEL));
+    const identityDescription = needsReferenceIdentity
+      ? await describeReferenceIdentity({
+          openai,
+          imageDataUrl,
+        })
+      : "";
     const editPrompt = buildEditPrompt({
-      role,
+      roleProfile,
       analysis,
     });
     const generatePrompt = buildGenerateFromReferencePrompt({
-      role,
+      roleProfile,
       analysis,
       identityDescription,
     });
@@ -882,7 +1118,7 @@ Keep the feedback concise, practical, respectful, and specific to the target rol
       remarks,
       analysis,
       improved_image: improvedImage,
-      download_filename: createDownloadFilename(role),
+      download_filename: createDownloadFilename(roleProfile.key),
       image_strategy: imageResult.mode,
       image_model_used: imageResult.model,
       transform_mode: IMAGE_TRANSFORM_MODE,
